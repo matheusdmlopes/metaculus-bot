@@ -1,8 +1,7 @@
 [project]
-name = "metac-bot-template"
+name = "metaculus-bot"
 version = "0.1.0"
-description = ""
-authors = [{ name = "Vasile Popescu", email = "elisescu@elisescu.com" }]
+description = "Bot de previsão para o torneio de bots da Metaculus, movido a Claude"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -13,6 +12,7 @@ dependencies = [
     "openai>=2.0.0,<3",
     "python-dotenv>=1.0.1,<2",
     "forecasting-tools>=0.2.90,<0.4.0",
+    "anthropic>=2.7.0",
 ]
 
 [dependency-groups]
@@ -22,6 +22,7 @@ integrations = [
 ]
 dev = [
     "ipykernel>=6.29.5,<7",
+    "pytest>=9.2.0",
 ]
 
 [tool.uv]

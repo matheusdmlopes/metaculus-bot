@@ -1,585 +1,360 @@
+"""
+Bot de previsão para o torneio de bots da Metaculus (FutureEval), movido a Claude.
+
+Para cada pergunta aberta:
+  1. uma pesquisa na web (Claude com busca e leitura de página) vira um briefing;
+  2. cinco previsões independentes leem o briefing, cada uma por um ângulo;
+  3. a biblioteca forecasting-tools agrega as cinco (mediana), publica a
+     previsão e posta o comentário com a pesquisa e os raciocínios.
+
+Uso:
+  uv run python main.py --checar                 confere as chaves
+  uv run python main.py --texto "Will X ...?"    prevê uma pergunta solta, sem publicar
+  uv run python main.py --pergunta <URL>         prevê uma pergunta da Metaculus, sem publicar
+  uv run python main.py --mode test_questions    roda na área de teste (não pontua)
+  uv run python main.py                          roda no torneio e no MiniBench (publica)
+
+Regra do torneio: nada de humano no meio. Não se roda o bot numa pergunta
+aberta do torneio para olhar a resposta e ajustar o bot em cima dela; por isso
+`--pergunta` recusa perguntas do torneio em andamento.
+"""
+
+from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
+import os
+import re
+import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal
+from pathlib import Path
+from typing import Any, Sequence
 
+import anthropic
 import dotenv
 
-# Runtime helpers (env validation, banners, dependency-warning suppression).
-from bot_helpers import (
-    check_environment,
-    print_run_summary_banner,
-    print_startup_banner,
-    silence_noisy_dependencies,
-)
+from bot_helpers import has_env, silence_noisy_dependencies
 
 silence_noisy_dependencies()
 
-from forecasting_tools import (
-    AskNewsSearcher,
+from forecasting_tools import (  # noqa: E402
     BinaryQuestion,
+    ConditionalPrediction,
+    ConditionalQuestion,
+    DateQuestion,
     ForecastBot,
-    GeneralLlm,
+    ForecastReport,
     MetaculusClient,
     MetaculusQuestion,
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
-    DateQuestion,
-    DatePercentile,
     Percentile,
-    ConditionalQuestion,
-    ConditionalPrediction,
-    PredictionTypes,
-    PredictionAffirmed,
-    BinaryPrediction,
+    PredictedOption,
     PredictedOptionList,
+    PredictionAffirmed,
+    PredictionTypes,
     ReasonedPrediction,
-    SmartSearcher,
     clean_indents,
-    structure_output,
 )
+
+import prompts  # noqa: E402
+from claude_llm import BudgetExceeded, Claude, ClaudeError  # noqa: E402
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+TEST_TOURNAMENT = "bot-testing-area"
+REPORTS_FOLDER = Path(__file__).parent / "relatorios"
 
-class FallTemplateBot2026(ForecastBot):
-    """
-    This is the template bot for the Fall 2026 FutureEval Bot Tournament.
-    This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
-    This template is given as-is, and is use-at-your-own-risk.
-    We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
-    So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
 
-    This bot is identical to SummerTemplateBot2026.
+@dataclass(frozen=True)
+class Settings:
+    """Ajustes do bot. Cada um pode ser trocado por variável de ambiente."""
 
-    The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
+    research_model: str = "claude-opus-5-5"
+    forecast_model: str = "claude-opus-5-5"
+    research_effort: str = "high"
+    forecast_effort: str = "high"
+    max_searches: int = 8
+    max_fetches: int = 5
+    forecasts_per_question: int = 5
+    max_usd_per_run: float = 25.0
+    parallel_calls: int = 4
+    parallel_questions: int = 2
 
-    Alternatively, you can use the MetaculusClient to make a custom filter of questions to forecast on
-    and forecast them with `bot.forecast_questions(questions)`
+    @classmethod
+    def from_env(cls) -> Settings:
+        defaults = cls()
+        values: dict[str, Any] = {}
+        for name, default in vars(defaults).items():
+            raw = os.getenv(f"BOT_{name.upper()}")
+            values[name] = type(default)(raw) if raw else default
+        return cls(**values)
 
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ForecastBot functions.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLM to intelligently reformat the output into the needed structure.
 
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions in the
-    primary bot tournament and MiniBench. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
+class ClaudeForecastBot(ForecastBot):
+    def __init__(
+        self,
+        *,
+        claude: Claude,
+        settings: Settings,
+        question_limit: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.claude = claude
+        self.settings = settings
+        self.question_limit = question_limit
+        self._lens_counter: dict[int, int] = {}
+        self._question_slots: asyncio.Semaphore | None = None
+        super().__init__(
+            research_reports_per_question=1,
+            predictions_per_research_report=settings.forecasts_per_question,
+            llms={
+                "default": settings.forecast_model,
+                "researcher": settings.research_model,
+            },
+            **kwargs,
+        )
 
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
+    @classmethod
+    def _llm_config_defaults(cls) -> dict[str, Any]:
+        # Só para o nome dos modelos sair certo no comentário publicado; as
+        # chamadas de verdade passam pelo claude_llm, não pelo litellm.
+        defaults = Settings()
+        return {
+            "default": defaults.forecast_model,
+            "researcher": defaults.research_model,
+        }
 
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name")
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
+    ##################################### FLUXO #####################################
 
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
-    """
+    async def forecast_questions(  # type: ignore[override]
+        self,
+        questions: Sequence[MetaculusQuestion],
+        return_exceptions: bool = False,
+    ) -> list[ForecastReport] | list[ForecastReport | BaseException]:
+        if self.skip_previously_forecasted_questions:
+            questions = [q for q in questions if not q.already_forecasted]
+        # As perguntas do torneio ficam abertas só por algumas horas: primeiro
+        # as que fecham antes.
+        far_future = datetime.max.replace(tzinfo=timezone.utc)
+        ordered = sorted(questions, key=lambda q: q.close_time or far_future)
+        if self.question_limit:
+            ordered = ordered[: self.question_limit]
+        return await super().forecast_questions(ordered, return_exceptions)
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
-    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    async def _run_individual_question(
+        self, question: MetaculusQuestion
+    ) -> ForecastReport:
+        if self._question_slots is None:
+            self._question_slots = asyncio.Semaphore(self.settings.parallel_questions)
+        async with self._question_slots:
+            self.claude.check_budget()
+            return await super()._run_individual_question(question)
 
-    ##################################### RESEARCH #####################################
+    ##################################### PESQUISA #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
+        if isinstance(question, ConditionalQuestion):
+            description = (
+                "This is a conditional pair. The forecaster will estimate the child "
+                "question assuming the parent resolves Yes, and assuming it resolves No.\n\n"
+                f"Parent question:\n{prompts.describe_question(question.parent)}\n\n"
+                f"Child question:\n{prompts.describe_question(question.child)}"
+            )
+        else:
+            description = prompts.describe_question(question)
 
-            prompt = self._get_research_prompt(question, researcher)
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
-
-    @staticmethod
-    def _get_research_prompt(
-        question: MetaculusQuestion, researcher: str | GeneralLlm
-    ) -> str:
-        if GeneralLlm.to_model_name(researcher) == "asknews/news-summaries":
-            return question.question_text
-
-        prompt = clean_indents(
-            f"""
-            You are an assistant to a superforecaster.
-            The superforecaster will give you a question they intend to forecast on.
-            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-            You do not produce forecasts yourself.
-
-            Question:
-            {question.question_text}
-
-            This question's outcome will be determined by the specific criteria below:
-            {question.resolution_criteria}
-
-            {question.fine_print}
-            """
+        reply = await self.claude.ask(
+            prompts.RESEARCH_TASK.format(today=prompts.today(), question=description),
+            system=prompts.RESEARCH_SYSTEM,
+            model=self.settings.research_model,
+            effort=self.settings.research_effort,
+            tools=prompts.research_tools(
+                self.settings.max_searches, self.settings.max_fetches
+            ),
+            cache=True,
         )
-        return prompt
+        logger.info(
+            "Pesquisa pronta: %s (%d buscas, US$ %.2f)",
+            question.page_url,
+            reply.web_searches,
+            reply.cost_usd,
+        )
+        return reply.text
 
-    ##################################### BINARY QUESTIONS #####################################
+    async def summarize_research(
+        self, question: MetaculusQuestion, research: str
+    ) -> str:
+        # O briefing já abre com a seção "Summary": aproveita, sem outra chamada.
+        match = re.search(r"##\s*Summary\s*\n(.*?)(?=\n##\s|\Z)", research, flags=re.S)
+        return match.group(1).strip() if match else research[:1200]
+
+    ##################################### PREVISÃO #####################################
+
+    async def _ask_forecaster(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        answer_instructions: str,
+        schema: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        key = question.id_of_question or id(question)
+        turn = self._lens_counter.get(key, 0)
+        self._lens_counter[key] = turn + 1
+        lens_name, lens_text = prompts.LENSES[turn % len(prompts.LENSES)]
+
+        disclaimer = self._get_conditional_disclaimer_if_necessary(question)
+        prompt = prompts.FORECAST_TASK.format(
+            today=prompts.today(),
+            question=prompts.describe_question(question),
+            research=research,
+            lens=f"{lens_text}\n\n{disclaimer}".strip(),
+            answer_instructions=answer_instructions,
+        )
+        reply = await self.claude.ask(
+            prompt,
+            system=prompts.FORECAST_SYSTEM,
+            model=self.settings.forecast_model,
+            effort=self.settings.forecast_effort,
+            schema=schema,
+        )
+        return reply.as_json(), lens_name
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
-            {question.question_text}
-
-            Question background:
-            {question.background_info}
-
-
-            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
-
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-            {self._get_conditional_disclaimer_if_necessary(question)}
-
-            The last thing you write is your final answer as: "Probability: ZZ%", 0-100
-            """
+        answer, lens = await self._ask_forecaster(
+            question, research, prompts.BINARY_ANSWER, prompts.BINARY_SCHEMA
         )
-
-        return await self._binary_prompt_to_forecast(question, prompt)
-
-    async def _binary_prompt_to_forecast(
-        self,
-        question: BinaryQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a probability forecast for a binary question.
-            {self._create_resolved_question_parsing_message()}
-            """
+        percent = float(answer["probability_percent"])
+        if not 0 <= percent <= 100:
+            raise ClaudeError(f"Probabilidade fora de 0 a 100: {percent}")
+        probability = min(0.99, max(0.01, percent / 100))
+        return ReasonedPrediction(
+            prediction_value=probability,
+            reasoning=_reasoning(lens, answer, f"Probability: {probability:.0%}"),
         )
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
-        )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
-
-    ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
-            {question.question_text}
-
-            The options are: {question.options}
-
-
-            Background:
-            {question.background_info}
-
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of a scenario that results in an unexpected outcome.
-
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
-
-            The last thing you write is your final probabilities for the N options in this order {question.options} as:
-            Option_A: Probability_A
-            Option_B: Probability_B
-            ...
-            Option_N: Probability_N
-            """
+        answer, lens = await self._ask_forecaster(
+            question,
+            research,
+            prompts.MULTIPLE_CHOICE_ANSWER.format(options=question.options),
+            prompts.multiple_choice_schema(question.options),
         )
-        return await self._multiple_choice_prompt_to_forecast(question, prompt)
-
-    async def _multiple_choice_prompt_to_forecast(
-        self,
-        question: MultipleChoiceQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        parsing_instructions = clean_indents(
-            f"""
-            Make sure that all option names are one of the following:
-            {question.options}
-
-            The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
-            Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
-            {self._create_resolved_question_parsing_message()}
-            """
+        given = {
+            item["option"]: float(item["probability_percent"])
+            for item in answer["options"]
+        }
+        missing = [option for option in question.options if option not in given]
+        total = sum(given.values())
+        if missing or total <= 0 or min(given.values()) < 0:
+            raise ClaudeError(
+                f"Resposta de múltipla escolha inválida (faltando: {missing}, soma: {total})"
+            )
+        # Piso por opção: nenhuma fica em zero, porque zero numa opção que
+        # acontece custa caro na pontuação.
+        floor = min(0.01, 0.2 / len(question.options))
+        floored = [max(given[option] / total, floor) for option in question.options]
+        probabilities = [value / sum(floored) for value in floored]
+        prediction = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name=option, probability=probability)
+                for option, probability in zip(question.options, probabilities)
+            ]
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
-        )
-
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
+        final = "\n".join(
+            f"- {option}: {probability:.1%}"
+            for option, probability in zip(question.options, probabilities)
         )
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=prediction, reasoning=_reasoning(lens, answer, final)
         )
-
-    ##################################### NUMERIC QUESTIONS #####################################
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = (
-            self._create_upper_and_lower_bound_messages(question)
+        upper_message, lower_message = self._create_upper_and_lower_bound_messages(
+            question
         )
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
-            {question.question_text}
-
-            Background:
-            {question.background_info}
-
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            {lower_bound_message}
-            {upper_bound_message}
-
-            Formatting Instructions:
-            - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
-            - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
-
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
-
-            The last thing you write is your final answer as:
-            "
-            Percentile 10: XX (lowest number value)
-            Percentile 20: XX
-            Percentile 40: XX
-            Percentile 60: XX
-            Percentile 80: XX
-            Percentile 90: XX (highest number value)
-            "
-            """
+        answer, lens = await self._ask_forecaster(
+            question,
+            research,
+            prompts.NUMERIC_ANSWER.format(
+                bounds=f"{lower_message}\n{upper_message}",
+                units=question.unit_of_measure or "not stated, infer from the question",
+            ),
+            prompts.NUMERIC_SCHEMA,
         )
-        return await self._numeric_prompt_to_forecast(question, prompt)
-
-    async def _numeric_prompt_to_forecast(
-        self,
-        question: NumericQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a forecast distribution for a numeric question.
-            - This text is trying to answer the numeric question: "{question.question_text}".
-            {self._create_single_distribution_parsing_message(question)}
-            {self._create_resolved_question_parsing_message()}
-            - When parsing the text, please make sure to give the values (the ones assigned to percentiles) in terms of the correct units.
-            - The units for the forecast are: {question.unit_of_measure}
-            - Your work will be shown publicly with these units stated verbatim after the numbers your parse.
-            - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
-            - If the answer doesn't give the answer in the correct units, you should parse it in the right units. For instance if the answer gives numbers as $500,000,000 and units are "B $" then you should parse the answer as 0.5 (since $500,000,000 is $0.5 billion).
-            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
-            - Turn any values that are in scientific notation into regular numbers.
-            """
+        values = [float(answer[prompts.percentile_key(p)]) for p in prompts.PERCENTILES]
+        prediction = _distribution(values, question)
+        final = "\n".join(
+            f"- Percentile {p}: {value:g}" for p, value in zip(prompts.PERCENTILES, values)
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
+        return ReasonedPrediction(
+            prediction_value=prediction, reasoning=_reasoning(lens, answer, final)
         )
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
-        )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-
-    ##################################### DATE QUESTIONS #####################################
 
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = (
-            self._create_upper_and_lower_bound_messages(question)
+        upper_message, lower_message = self._create_upper_and_lower_bound_messages(
+            question
         )
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
-            {question.question_text}
-
-            Background:
-            {question.background_info}
-
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            {lower_bound_message}
-            {upper_bound_message}
-
-            Formatting Instructions:
-            - This is a date question, and as such, the answer must be expressed in terms of dates.
-            - The dates must be written in the format of YYYY-MM-DD. If hours matter, please append the date with the hour in UTC and military time: YYYY-MM-DDTHH:MM:SSZ. No other formatting is allowed.
-            - Always start with a lower date chronologically and then increase from there.
-            - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
-
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
-
-            The last thing you write is your final answer as:
-            "
-            Percentile 10: YYYY-MM-DD (oldest date)
-            Percentile 20: YYYY-MM-DD
-            Percentile 40: YYYY-MM-DD
-            Percentile 60: YYYY-MM-DD
-            Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD (newest date)
-            "
-            """
+        answer, lens = await self._ask_forecaster(
+            question,
+            research,
+            prompts.DATE_ANSWER.format(bounds=f"{lower_message}\n{upper_message}"),
+            prompts.DATE_SCHEMA,
         )
-        forecast = await self._date_prompt_to_forecast(question, prompt)
-        return forecast
-
-    async def _date_prompt_to_forecast(
-        self,
-        question: DateQuestion,
-        prompt: str,
-    ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a forecast distribution for a date question.
-            - This text is trying to answer the question: "{question.question_text}".
-            {self._create_single_distribution_parsing_message(question)}
-            {self._create_resolved_question_parsing_message()}
-            - As an example, someone else guessed that the answer will be between {question.lower_bound} and {question.upper_bound}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
-            - The output is given as dates/times please format it into a valid datetime parsable string. Assume midnight UTC if no hour is given.
-            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
-            """
+        dates = [answer[prompts.percentile_key(p)] for p in prompts.PERCENTILES]
+        prediction = _distribution([_timestamp(date) for date in dates], question)
+        final = "\n".join(
+            f"- Percentile {p}: {date}" for p, date in zip(prompts.PERCENTILES, dates)
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
+        return ReasonedPrediction(
+            prediction_value=prediction, reasoning=_reasoning(lens, answer, final)
         )
-
-        percentile_list = [
-            Percentile(
-                percentile=percentile.percentile,
-                value=percentile.value.timestamp(),
-            )
-            for percentile in date_percentile_list
-        ]
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
-        )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-
-    def _create_resolved_question_parsing_message(self) -> str:
-        return "- If the text concludes that the question has already resolved *in the past* (i.e. it treats the question as decided rather than something to forecast), please DO NOT return a parsed output, even if a final forecast is also given. Instead indicate that the answer is not explicitly given in the text.\n"
-
-    def _create_single_distribution_parsing_message(
-        self, question: NumericQuestion | DateQuestion
-    ) -> str:
-        message = (
-            "- The text may contain multiple percentile distributions (e.g. forecasts for several related questions/entities, or intermediate drafts before a final answer). You must return exactly ONE distribution: the single final distribution that answers the question stated above.\n"
-            "- Never merge or concatenate percentile lists that refer to different entities, options, or scenarios. Each percentile should appear at most once in your output.\n"
-            "- If there are multiple final distributions and you cannot tell which one answers the question stated above, do not guess or combine them. Instead indicate that the answer is not explicitly given in the text."
-        )
-        if question.group_question_option is not None:
-            message += (
-                f'\n- This question is specifically about "{question.group_question_option}" (one subquestion within a group of related questions). '
-                f'If the text gives distributions for multiple subjects, return only the distribution for "{question.group_question_option}".'
-            )
-        return message
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
     ) -> tuple[str, str]:
-        if isinstance(question, NumericQuestion):
-            if question.nominal_upper_bound is not None:
-                upper_bound_number = question.nominal_upper_bound
-            else:
-                upper_bound_number = question.upper_bound
-            if question.nominal_lower_bound is not None:
-                lower_bound_number = question.nominal_lower_bound
-            else:
-                lower_bound_number = question.lower_bound
-            unit_of_measure = question.unit_of_measure
-        elif isinstance(question, DateQuestion):
-            upper_bound_number = question.upper_bound.date().isoformat()
-            lower_bound_number = question.lower_bound.date().isoformat()
-            unit_of_measure = ""
+        if isinstance(question, DateQuestion):
+            upper: Any = question.upper_bound.date().isoformat()
+            lower: Any = question.lower_bound.date().isoformat()
+            unit = ""
         else:
-            raise ValueError()
+            upper = (
+                question.nominal_upper_bound
+                if question.nominal_upper_bound is not None
+                else question.upper_bound
+            )
+            lower = (
+                question.nominal_lower_bound
+                if question.nominal_lower_bound is not None
+                else question.lower_bound
+            )
+            unit = question.unit_of_measure or ""
 
         if question.open_upper_bound:
-            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
+            upper_message = f"The question creator thinks the answer is likely not higher than {upper} {unit}."
         else:
-            upper_bound_message = f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
-
+            upper_message = f"The answer cannot be higher than {upper} {unit}."
         if question.open_lower_bound:
-            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
+            lower_message = f"The question creator thinks the answer is likely not lower than {lower} {unit}."
         else:
-            lower_bound_message = f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
-        return upper_bound_message, lower_bound_message
+            lower_message = f"The answer cannot be lower than {lower} {unit}."
+        return upper_message.strip(), lower_message.strip()
 
-    ##################################### CONDITIONAL QUESTIONS #####################################
+    ############################# PERGUNTAS CONDICIONAIS #############################
+    # Fluxo do template oficial, sem mudança: prevê pai, filho e os dois ramos
+    # reaproveitando as funções de previsão acima.
 
     async def _run_forecast_on_conditional(
         self, question: ConditionalQuestion, research: str
@@ -629,7 +404,6 @@ class FallTemplateBot2026(ForecastBot):
             and previous_forecasts
             and question_type not in self.force_reforecast_in_conditional
         ):
-            # TODO: add option to not affirm current parent/child forecasts, create new forecast
             previous_forecast = previous_forecasts[-1]
             current_utc_time = datetime.now(timezone.utc)
             if (
@@ -675,12 +449,306 @@ class FallTemplateBot2026(ForecastBot):
     ) -> str:
         if question.conditional_type not in ["yes", "no"]:
             return ""
-        return clean_indents(
-            """
-            As you are given a conditional question with a parent and child, you are to only forecast the **CHILD** question, given the parent question's resolution.
-            You never re-forecast the parent question under any circumstances, but you use probabilistic reasoning, strongly considering the parent question's resolution, to forecast the child question.
-            """
+        return (
+            "This is a conditional question with a parent and a child. Forecast only "
+            "the CHILD question, given how the parent resolved. Do not re-forecast the parent."
         )
+
+
+def _reasoning(lens: str, answer: dict[str, Any], final_answer: str) -> str:
+    return f"*Angle: {lens}*\n\n{str(answer['rationale']).strip()}\n\n{final_answer}"
+
+
+def _timestamp(date_text: str) -> float:
+    parsed = datetime.fromisoformat(date_text.strip())
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _distribution(
+    values: list[float], question: NumericQuestion | DateQuestion
+) -> NumericDistribution:
+    """Monta a distribuição a partir dos valores nos percentis de prompts.PERCENTILES."""
+    if isinstance(question, DateQuestion):
+        lower, upper = question.lower_bound.timestamp(), question.upper_bound.timestamp()
+    else:
+        lower, upper = question.lower_bound, question.upper_bound
+
+    if values != sorted(values):
+        logger.warning("Percentis vieram fora de ordem; reordenando")
+        values = sorted(values)
+
+    # Limite fechado: nada passa dele. Limite aberto: pode passar, mas a
+    # biblioteca rejeita valor absurdamente longe da faixa da pergunta.
+    slack = 1.5 * (upper - lower)
+    floor = lower - slack if question.open_lower_bound else lower
+    ceiling = upper + slack if question.open_upper_bound else upper
+    fitted = [min(ceiling, max(floor, value)) for value in values]
+
+    return NumericDistribution.from_question(
+        [
+            Percentile(percentile=p / 100, value=value)
+            for p, value in zip(prompts.PERCENTILES, fitted)
+        ],
+        question,
+    )
+
+
+############################### LINHA DE COMANDO ###############################
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Bot de previsão da Metaculus movido a Claude"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["tournament", "test_questions"],
+        default="tournament",
+        help="tournament: torneio de bots + MiniBench (padrão). test_questions: área de teste, não pontua",
+    )
+    parser.add_argument(
+        "--pergunta",
+        action="append",
+        metavar="URL",
+        help="prevê esta pergunta da Metaculus sem publicar (pode repetir)",
+    )
+    parser.add_argument(
+        "--texto",
+        metavar="PERGUNTA",
+        help="prevê uma pergunta de sim ou não escrita na hora, sem publicar",
+    )
+    parser.add_argument(
+        "--sem-publicar",
+        action="store_true",
+        help="na área de teste, só mostra a previsão em vez de enviar",
+    )
+    parser.add_argument(
+        "--limite", type=int, metavar="N", help="no máximo N perguntas nesta execução"
+    )
+    parser.add_argument(
+        "--checar", action="store_true", help="confere as chaves e sai"
+    )
+    args = parser.parse_args()
+    if args.sem_publicar and args.mode != "test_questions":
+        parser.error(
+            "--sem-publicar só vale com --mode test_questions. Rodar o bot em pergunta "
+            "aberta do torneio só para olhar a resposta fere a regra do torneio."
+        )
+    return args
+
+
+def missing_env(*names: str) -> list[str]:
+    return [name for name in names if not has_env(name)]
+
+
+async def check_keys(settings: Settings, claude: Claude) -> int:
+    """Confere as duas chaves e faz uma chamada mínima igual às do bot."""
+    problems = 0
+
+    if not has_env("ANTHROPIC_API_KEY"):
+        print("Anthropic: falta ANTHROPIC_API_KEY no .env")
+        problems += 1
+    else:
+        try:
+            for model in sorted({settings.research_model, settings.forecast_model}):
+                await claude.model_is_reachable(model)
+            reply = await claude.ask(
+                "Is water wet? This is a connectivity test.",
+                system="Answer the test question.",
+                model=settings.forecast_model,
+                effort="low",
+                schema=prompts.BINARY_SCHEMA,
+                max_tokens=2000,
+            )
+            reply.as_json()
+            print(f"Anthropic: chave válida, {settings.forecast_model} respondeu")
+            search = await claude.ask(
+                "Search the web once for today's top world news headline and report it in one sentence.",
+                system="Answer briefly.",
+                model=settings.research_model,
+                effort="low",
+                tools=prompts.research_tools(1, 1),
+                max_tokens=4000,
+            )
+            if search.web_searches:
+                print("Anthropic: busca na web funcionando")
+            else:
+                print(
+                    "Anthropic: a chamada passou, mas a busca na web não rodou. "
+                    "Confira se a busca está liberada na organização, no Console."
+                )
+                problems += 1
+            print(f"Anthropic: custo deste teste: US$ {claude.spent_usd:.2f}")
+        except anthropic.AuthenticationError:
+            print("Anthropic: chave inválida (ANTHROPIC_API_KEY)")
+            problems += 1
+        except anthropic.NotFoundError as error:
+            print(f"Anthropic: modelo não encontrado para esta chave: {error.message}")
+            problems += 1
+        except anthropic.APIConnectionError:
+            print("Anthropic: sem conexão com a API")
+            problems += 1
+        except (anthropic.APIStatusError, ClaudeError) as error:
+            print(f"Anthropic: a chamada de teste falhou: {error}")
+            problems += 1
+
+    if not has_env("METACULUS_TOKEN"):
+        print("Metaculus: falta METACULUS_TOKEN no .env")
+        problems += 1
+    else:
+        try:
+            questions = await asyncio.to_thread(
+                MetaculusClient().get_all_open_questions_from_tournament, TEST_TOURNAMENT
+            )
+            print(
+                f"Metaculus: token válido, {len(questions)} pergunta(s) aberta(s) na área de teste"
+            )
+        except Exception as error:  # a biblioteca levanta tipos variados aqui
+            print(f"Metaculus: não consegui ler a área de teste: {error}")
+            problems += 1
+
+    print("Tudo certo." if problems == 0 else f"{problems} problema(s) acima.")
+    return 1 if problems else 0
+
+
+def is_live_tournament_question(question: MetaculusQuestion) -> bool:
+    live = {
+        str(MetaculusClient.CURRENT_AI_COMPETITION_ID),
+        str(MetaculusClient.CURRENT_MINIBENCH_ID),
+        "fall-futureeval-2026",
+    }
+    ids = {str(slug) for slug in question.tournament_slugs}
+    ids.add(str(question.default_project_id))
+    return bool(live & ids)
+
+
+def save_report(report: ForecastReport) -> Path:
+    REPORTS_FOLDER.mkdir(exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", report.question.question_text.lower())[:60].strip("-")
+    path = REPORTS_FOLDER / f"{datetime.now():%Y-%m-%d-%H%M%S}-{slug}.md"
+    path.write_text(report.explanation, encoding="utf-8")
+    return path
+
+
+def print_summary(
+    results: Sequence[ForecastReport | BaseException],
+    claude: Claude,
+    show_content: bool,
+) -> int:
+    """
+    Resumo da execução. Devolve o código de saída: 1 se alguma pergunta falhou.
+
+    No torneio (`show_content=False`) não sai previsão nem raciocínio, só o
+    endereço e o estado de cada pergunta: o log do GitHub Actions é público em
+    repositório público, e ninguém deve ajustar o bot olhando resposta de
+    pergunta aberta.
+    """
+    reports = [r for r in results if isinstance(r, ForecastReport)]
+    failures = [r for r in results if isinstance(r, BaseException)]
+    postponed = [f for f in failures if "BudgetExceeded" in f"{type(f).__name__} {f}"]
+    failures = [f for f in failures if f not in postponed]
+
+    print("\n" + "=" * 80)
+    if not results:
+        print("Nenhuma pergunta nova nesta execução.")
+    for report in reports:
+        note = f" ({len(report.errors)} erro(s) menor(es))" if report.errors else ""
+        if show_content:
+            readable = type(report).make_readable_prediction(report.prediction)
+            print(f"\n{report.question.question_text}")
+            print(f"  Previsão: {readable.strip()}")
+            print(
+                f"  Custo: US$ {report.price_estimate or 0:.2f} | "
+                f"Tempo: {report.minutes_taken or 0:.1f} min{note}"
+            )
+            print(f"  Relatório completo: {save_report(report)}")
+        else:
+            print(f"ok     {report.question.page_url}{note}")
+    for failure in failures:
+        message = str(failure)
+        print(f"FALHOU {type(failure).__name__}: {message[:300]}")
+    if postponed:
+        print(f"{len(postponed)} pergunta(s) adiada(s): teto de gasto da execução atingido.")
+
+    print(
+        f"\nTotal: {len(reports)} prevista(s), {len(failures)} com falha | "
+        f"{claude.calls} chamada(s) ao Claude, {claude.web_searches} busca(s), "
+        f"US$ {claude.spent_usd:.2f}"
+    )
+    print("=" * 80)
+    return 1 if failures else 0
+
+
+async def run(args: argparse.Namespace) -> int:
+    settings = Settings.from_env()
+    claude = Claude(
+        max_usd_per_run=settings.max_usd_per_run, parallel_calls=settings.parallel_calls
+    )
+    if args.checar:
+        return await check_keys(settings, claude)
+
+    local_only = bool(args.texto or args.pergunta)
+    publish = not (local_only or args.sem_publicar)
+    in_tournament = args.mode == "tournament" and not local_only
+    if in_tournament:
+        # No torneio o log fica só com avisos e erros, sem conteúdo de previsão.
+        logging.getLogger("forecasting_tools").setLevel(logging.WARNING)
+
+    needed = ["ANTHROPIC_API_KEY"] if args.texto else ["ANTHROPIC_API_KEY", "METACULUS_TOKEN"]
+    if missing := missing_env(*needed):
+        print(f"Falta no .env: {', '.join(missing)}. Confira com: uv run python main.py --checar")
+        return 1
+
+    bot = ClaudeForecastBot(
+        claude=claude,
+        settings=settings,
+        question_limit=args.limite,
+        publish_reports_to_metaculus=publish,
+        skip_previously_forecasted_questions=in_tournament,
+        extra_metadata_in_explanation=True,
+    )
+    print(
+        f"Modo: {'pergunta avulsa' if local_only else args.mode} | "
+        f"publica: {'sim' if publish else 'não'} | "
+        f"pesquisa: {settings.research_model} | previsão: {settings.forecast_model} x"
+        f"{settings.forecasts_per_question} | teto: US$ {settings.max_usd_per_run:.2f}\n"
+    )
+
+    results: list[ForecastReport | BaseException]
+    if args.texto:
+        question = BinaryQuestion(question_text=args.texto)
+        results = await bot.forecast_questions([question], return_exceptions=True)
+    elif args.pergunta:
+        questions = []
+        for url in args.pergunta:
+            question = await asyncio.to_thread(bot.metaculus_client.get_question_by_url, url)
+            if is_live_tournament_question(question):
+                print(
+                    f"Recusado: {url} é do torneio em andamento. O bot prevê essa pergunta "
+                    "sozinho, no modo torneio; olhar a resposta antes fere a regra."
+                )
+                return 1
+            questions.append(question)
+        results = await bot.forecast_questions(questions, return_exceptions=True)
+    elif args.mode == "test_questions":
+        results = await bot.forecast_on_tournament(TEST_TOURNAMENT, return_exceptions=True)
+    else:
+        results = []
+        for tournament in (
+            MetaculusClient.CURRENT_AI_COMPETITION_ID,
+            MetaculusClient.CURRENT_MINIBENCH_ID,
+        ):
+            try:
+                results += await bot.forecast_on_tournament(
+                    tournament, return_exceptions=True
+                )
+            except Exception as error:  # um torneio fora do ar não derruba o outro
+                logger.error("Não consegui ler o torneio %s: %s", tournament, error)
+                results.append(error)
+
+    return print_summary(results, claude, show_content=not in_tournament)
 
 
 if __name__ == "__main__":
@@ -688,96 +756,4 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    parser = argparse.ArgumentParser(description="Run the template forecasting bot")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["tournament", "metaculus_cup", "test_questions"],
-        default="tournament",
-        help="What to forecast on (default: tournament)",
-    )
-    args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
-
-    check_environment(strict=True)
-    publish_to_metaculus = True
-    print_startup_banner(run_mode, will_publish=publish_to_metaculus)
-
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = FallTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
-    )
-
-    # Per-mode tournament URL shown in the summary banner footer. These
-    # piggyback on the forecasting_tools SDK constants and need updating
-    # whenever those rotate seasons.
-    TOURNAMENT_URLS = {
-        "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
-        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
-        "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
-    }
-
-    # Dispatch on mode. Each branch produces a list of ForecastReport (or
-    # exceptions, since return_exceptions=True) which then flows into the
-    # summary printers below.
-    client = MetaculusClient()
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
-        # MetaculusClient.AI_2027_TOURNAMENT_ID = "ai-2027" are also valid
-        # targets here.
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
-        )
-
-    template_bot.log_report_summary(forecast_reports)
-    print_run_summary_banner(
-        forecast_reports,
-        will_publish=publish_to_metaculus,
-        tournament_url=TOURNAMENT_URLS.get(run_mode),
-    )
+    sys.exit(asyncio.run(run(parse_args())))

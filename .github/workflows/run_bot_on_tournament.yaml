@@ -3,25 +3,28 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
+    # A cada 20 minutos, fora da hora cheia. As perguntas do torneio ficam
+    # abertas por cerca de 3 horas; o bot pula as que já previu.
+    - cron: "7,27,47 * * * *"
 
-# Add concurrency group to prevent parallel runs
+# Uma execução por vez: a seguinte espera a anterior acabar.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
-
-# Daily job to run the simple forecast bot
 jobs:
   forecast_job:
-    runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
-    steps: # sets up the steps that will be run in order
-      # setup repository with all necessary dependencies - keep as is
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      actions: write # só para o passo "Keep the schedule alive"
+    steps:
       - name: Check out repository
         uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
         with:
@@ -29,16 +32,19 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
       - name: Run bot
-        run: |
-          uv run python main.py
-        # this reads the environment variables from the github repository.
-        # Store under Settings --> Secrets and variables --> Actions
+        run: uv run python main.py
+        # Segredos em Settings -> Secrets and variables -> Actions.
+        # As variáveis BOT_* são opcionais (aba Variables); vazias, vale o padrão do main.py.
         env:
-          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
-          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          BOT_RESEARCH_MODEL: ${{ vars.BOT_RESEARCH_MODEL }}
+          BOT_FORECAST_MODEL: ${{ vars.BOT_FORECAST_MODEL }}
+          BOT_MAX_USD_PER_RUN: ${{ vars.BOT_MAX_USD_PER_RUN }}
+      - name: Keep the schedule alive
+        # Em repositório público o GitHub desliga o agendamento depois de 60 dias
+        # sem atividade no repositório. Religar pela API zera essa contagem.
+        if: always()
+        run: gh api --silent -X PUT "repos/${{ github.repository }}/actions/workflows/run_bot_on_tournament.yaml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
