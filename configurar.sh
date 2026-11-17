@@ -110,18 +110,25 @@ ask() {
   printf -v "$key" '%s' "$input"
 }
 
-# ask_secret KEY "Prompt" is like ask, but input is hidden.
+# ask_secret KEY "Prompt" is like ask, for keys and tokens. The input is shown
+# on purpose: with a hidden prompt the human can't tell whether a paste landed.
+# It strips whitespace and confirms what arrived (length and last 4 characters).
 ask_secret() {
   local key="$1" prompt="$2" current input
   current=$(_existing "$key" || true)
   if [[ -n "$current" ]]; then
-    printf '  %s%s%s %s[Enter keeps current]%s ' "$BOLD" "$prompt" "$RESET" "$DIM" "$RESET"
+    printf '  %s%s%s %s[Enter keeps current, ending in %s]%s ' "$BOLD" "$prompt" "$RESET" "$DIM" "${current: -4}" "$RESET"
   else
     printf '  %s%s%s ' "$BOLD" "$prompt" "$RESET"
   fi
-  read -rs input || true
-  printf '\n'
+  read -r input || true
+  input="${input//[[:space:]]/}"
   [[ -z "$input" && -n "$current" ]] && input="$current"
+  if [[ -n "$input" ]]; then
+    printf '  %s✓ received%s %d characters, ending in %s\n' "$GREEN" "$RESET" "${#input}" "${input: -4}"
+  else
+    warn "nothing received"
+  fi
   printf -v "$key" '%s' "$input"
 }
 
@@ -189,6 +196,39 @@ TOTAL_STAGES=7
 
 banner "Bot da Metaculus: contas e chaves"
 
+# pedir_chave VAR "pergunta" PREFIXO TAMANHO_MINIMO lê uma chave com o texto
+# aparecendo na tela, confere o formato e repete até vir uma que sirva.
+pedir_chave() {
+  local var="$1" pergunta="$2" prefixo="$3" minimo="$4" atual valor
+  atual=$(_existing "$var" || true)
+  if [[ -n "$atual" ]] && { [[ "$atual" != "$prefixo"* ]] || (( ${#atual} < minimo )); }; then
+    warn "O que está salvo em $var não serve (${#atual} caracteres). Cole de novo."
+    atual=""
+  fi
+  note "No terminal, colar é Ctrl+Shift+V. O que você colar aparece na tela."
+  while true; do
+    if [[ -n "$atual" ]]; then
+      printf '  %s%s%s %s[Enter mantém a salva, que termina em %s]%s ' "$BOLD" "$pergunta" "$RESET" "$DIM" "${atual: -4}" "$RESET"
+    else
+      printf '  %s%s%s ' "$BOLD" "$pergunta" "$RESET"
+    fi
+    if ! read -r valor; then printf '\n'; exit 1; fi
+    valor="${valor//[[:space:]]/}"
+    [[ -z "$valor" && -n "$atual" ]] && valor="$atual"
+    if [[ -z "$valor" ]]; then
+      warn "Não chegou nada. Cole de novo e aperte Enter."
+    elif [[ "$valor" != "$prefixo"* ]]; then
+      warn "Chegaram ${#valor} caracteres, mas essa chave começa com $prefixo. Cole de novo."
+    elif (( ${#valor} < minimo )); then
+      warn "Chegaram só ${#valor} caracteres; a chave é maior que isso. Cole de novo."
+    else
+      printf '  %s✓ recebi%s %d caracteres, terminando em %s\n' "$GREEN" "$RESET" "${#valor}" "${valor: -4}"
+      break
+    fi
+  done
+  printf -v "$var" '%s' "$valor"
+}
+
 # ── 1. Conta na Metaculus ─────────────────────────────────────────────────
 stage "Metaculus: sua conta"
 say "O bot precisa de uma conta humana por trás. É a sua conta pessoal na Metaculus."
@@ -202,11 +242,8 @@ stage "Metaculus: criar o bot e copiar o token"
 say "Na mesma página (My Forecasting Bots):"
 step "Clique em Create Bot e escolha o nome do bot. O nome aparece no ranking público."
 step "O primeiro bot que você cria é o que concorre a prêmio. Crie um só."
-step "Copie o token (API key) do bot recém-criado."
-METACULUS_TOKEN=""
-while [[ -z "$METACULUS_TOKEN" ]]; do
-  ask_secret METACULUS_TOKEN "Cole o token do bot (não aparece na tela):"
-done
+step "No bot recém-criado, clique em Reveal API Key e copie o token."
+pedir_chave METACULUS_TOKEN "Cole o token do bot e aperte Enter:" "" 20
 write_env METACULUS_TOKEN "$METACULUS_TOKEN"
 
 # ── 3. Formulário de participação ─────────────────────────────────────────
@@ -222,12 +259,9 @@ stage "Anthropic: chave da API"
 say "A chave tem que sair da organização onde estão os seus créditos."
 open_url "https://platform.claude.com/settings/keys"
 step "Confira no seletor de organização que está na sua organização individual (a que tem os créditos)."
-step "Recomendado: crie um workspace só para o bot (ex.: metaculus-bot) e ponha um limite de gasto mensal nele. Assim o gasto do bot fica separado e tem trava."
-step "Crie uma chave (Create Key), no workspace do bot se você criou um, e copie."
-ANTHROPIC_API_KEY=""
-while [[ -z "$ANTHROPIC_API_KEY" ]]; do
-  ask_secret ANTHROPIC_API_KEY "Cole a chave da Anthropic (não aparece na tela):"
-done
+step "Clique em Create key e escolha Somewhere else (é a opção que dá uma chave)."
+step "Se der para escolher workspace, use um só do bot com limite mensal de US\$ 150 (US\$ 5 por dia)."
+pedir_chave ANTHROPIC_API_KEY "Cole a chave da Anthropic e aperte Enter:" "sk-ant-" 40
 write_env ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
 chmod 600 "$ENV_FILE"
 
@@ -248,7 +282,7 @@ pause "Tudo certo. Enter para continuar"
 stage "Primeira previsão (opcional)"
 say "O bot pega uma pergunta da área de teste da Metaculus, pesquisa na web,"
 say "faz as cinco previsões e mostra o resultado aqui. Não publica nada."
-note "Estimativa de custo: de US\$ 1 a US\$ 3 de crédito. O valor exato sai no fim."
+note "Estimativa de custo: menos de US\$ 1 de crédito. O valor exato sai no fim."
 if confirm "Rodar agora?"; then
   uv run python main.py --mode test_questions --limite 1 --sem-publicar || warn "A execução falhou; a mensagem acima diz o motivo."
 else
@@ -262,7 +296,7 @@ stage "GitHub: ligar o bot no torneio"
 say "Falta mandar as duas chaves para o repositório no GitHub (como segredo, ninguém vê)"
 say "e ligar o agendamento. Daí em diante o bot roda sozinho a cada 20 minutos, prevê as"
 say "perguntas abertas do torneio e do MiniBench e gasta crédito de verdade."
-note "Tetos do bot: US\$ 8 por execução e US\$ 15 por dia. Além deles, ponha o limite mensal no workspace no Console."
+note "Tetos do bot: US\$ 3 por execução e US\$ 5 por dia, uns US\$ 150 por mês no máximo."
 note "Depois de ligado, não ajuste o bot olhando resposta de pergunta ainda aberta do torneio."
 if confirm "Mandar as chaves e ligar agora?"; then
   set_secret METACULUS_TOKEN "$METACULUS_TOKEN"

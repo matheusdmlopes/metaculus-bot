@@ -331,53 +331,60 @@ def today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def test_day_cap_counts_what_earlier_runs_spent(tmp_path: Path) -> None:
+def day_capped_bot(ledger: Path, forecasts: list[dict[str, Any]]) -> tuple[Any, Claude, FakeAnthropic]:
+    claude = Claude(
+        max_usd_per_run=100, parallel_calls=4, max_usd_per_day=5.0, day_ledger=ledger
+    )
+    fake = FakeAnthropic(scripted(forecasts))
+    claude._client = fake  # type: ignore[assignment]
+    claude._slots = asyncio.Semaphore(4)
+    bot = main.ClaudeForecastBot(
+        claude=claude, settings=main.Settings(), publish_reports_to_metaculus=False
+    )
+    return bot, claude, fake
+
+
+def test_day_cap_only_starts_a_question_that_fits(tmp_path: Path) -> None:
     ledger = tmp_path / ".gasto" / "gasto-do-dia.json"
     ledger.parent.mkdir()
-    ledger.write_text(json.dumps({"dia": today_utc(), "usd": 14.95}))
-    forecasts = [{"rationale": "Fine.", "probability_percent": 40}] * 10
+    ledger.write_text(json.dumps({"dia": today_utc(), "usd": 3.9}))
+    forecasts = [{"rationale": "Fine.", "probability_percent": 40}] * 15
     questions = [
-        BinaryQuestion(question_text=f"Question {i}?", id_of_question=i) for i in (1, 2)
+        BinaryQuestion(question_text=f"Question {i}?", id_of_question=i) for i in (1, 2, 3)
     ]
 
     async def go() -> tuple[list[Any], Claude]:
-        claude = Claude(
-            max_usd_per_run=100, parallel_calls=4, max_usd_per_day=15.0, day_ledger=ledger
-        )
-        claude._client = FakeAnthropic(scripted(forecasts))  # type: ignore[assignment]
-        claude._slots = asyncio.Semaphore(4)
-        bot = main.ClaudeForecastBot(
-            claude=claude,
-            settings=main.Settings(parallel_questions=1),
-            publish_reports_to_metaculus=False,
-        )
+        bot, claude, _fake = day_capped_bot(ledger, forecasts)
         results = list(await bot.forecast_questions(questions, return_exceptions=True))
         return results, claude
 
     results, claude = asyncio.run(go())
-    # A primeira cabe (14,95 < 15) e leva o dia acima do teto; a segunda fica de fora.
+    question_cost = 6 * 0.08 + 3 * 0.01
+    # 1ª: 3,90 + 1,00 de reserva cabe em 5. 2ª: 4,41 + 0,51 cabe. 3ª: 4,92 + 0,51 não cabe.
     assert isinstance(results[0], ForecastReport)
-    assert "por dia" in str(results[1])
-    assert claude.spent_today_usd == pytest.approx(14.95 + 6 * 0.08 + 3 * 0.01)
+    assert isinstance(results[1], ForecastReport)
+    assert "por dia" in str(results[2])
+    assert claude.spent_today_usd == pytest.approx(3.9 + 2 * question_cost)
+    assert claude.spent_today_usd <= 5.0
     saved = json.loads(ledger.read_text())
     assert saved["dia"] == today_utc()
     assert saved["usd"] == pytest.approx(claude.spent_today_usd, abs=1e-4)
+    assert saved["maior_pergunta"] == pytest.approx(question_cost, abs=1e-4)
 
 
-def test_day_cap_blocks_before_any_call_when_the_day_is_spent(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"usd": 4.5},  # sem pergunta hoje ainda: reserva US$ 1 e não cabe
+        {"usd": 2.0, "maior_pergunta": 3.5},  # a pergunta mais cara do dia não caberia
+    ],
+)
+def test_day_cap_blocks_before_any_call(tmp_path: Path, record: dict[str, float]) -> None:
     ledger = tmp_path / "gasto-do-dia.json"
-    ledger.write_text(json.dumps({"dia": today_utc(), "usd": 15.0}))
+    ledger.write_text(json.dumps({"dia": today_utc(), **record}))
 
     async def go() -> tuple[list[Any], FakeAnthropic]:
-        claude = Claude(
-            max_usd_per_run=100, parallel_calls=4, max_usd_per_day=15.0, day_ledger=ledger
-        )
-        fake = FakeAnthropic(scripted([]))
-        claude._client = fake  # type: ignore[assignment]
-        claude._slots = asyncio.Semaphore(4)
-        bot = main.ClaudeForecastBot(
-            claude=claude, settings=main.Settings(), publish_reports_to_metaculus=False
-        )
+        bot, claude, fake = day_capped_bot(ledger, [])
         question = BinaryQuestion(question_text="Question?", id_of_question=1)
         results = list(await bot.forecast_questions([question], return_exceptions=True))
         assert main.print_summary(results, claude, show_content=False) == 0
@@ -390,7 +397,7 @@ def test_day_cap_blocks_before_any_call_when_the_day_is_spent(tmp_path: Path) ->
 
 @pytest.mark.parametrize(
     "content",
-    ['{"dia": "2020-01-01", "usd": 999}', "{}", "not json", None],
+    ['{"dia": "2020-01-01", "usd": 999, "maior_pergunta": 9}', "{}", "not json", None],
 )
 def test_day_count_starts_at_zero_without_a_record_for_today(
     tmp_path: Path, content: str | None
@@ -399,11 +406,21 @@ def test_day_count_starts_at_zero_without_a_record_for_today(
     if content is not None:
         ledger.write_text(content)
     claude = Claude(
-        max_usd_per_run=100, parallel_calls=1, max_usd_per_day=15.0, day_ledger=ledger
+        max_usd_per_run=100, parallel_calls=1, max_usd_per_day=5.0, day_ledger=ledger
     )
     assert claude.spent_today_usd == 0.0
     claude.check_budget()
-    assert json.loads(ledger.read_text()) == {"dia": today_utc(), "usd": 0.0}
+    assert json.loads(ledger.read_text()) == {
+        "dia": today_utc(),
+        "usd": 0.0,
+        "maior_pergunta": 0.0,
+    }
+
+
+def test_defaults_stay_inside_the_five_dollar_day() -> None:
+    settings = main.Settings()
+    assert settings.max_usd_per_day <= 5.0
+    assert settings.max_usd_per_run <= settings.max_usd_per_day
 
 
 def test_live_tournament_question_is_refused_for_dry_runs() -> None:

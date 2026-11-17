@@ -77,17 +77,20 @@ SPEND_FILE = Path(__file__).parent / ".gasto" / "gasto-do-dia.json"
 class Settings:
     """Ajustes do bot. Cada um pode ser trocado por variável de ambiente."""
 
-    research_model: str = "claude-opus-5-5"
-    forecast_model: str = "claude-opus-5-5"
+    # Sonnet custa metade do Opus; com teto de US$ 5 por dia é o que deixa o
+    # bot responder a maior parte das perguntas em vez de três ou quatro.
+    research_model: str = "claude-sonnet-5-5"
+    forecast_model: str = "claude-sonnet-5-5"
     research_effort: str = "high"
     forecast_effort: str = "high"
-    max_searches: int = 8
-    max_fetches: int = 5
+    max_searches: int = 6
+    max_fetches: int = 3
     forecasts_per_question: int = 5
-    max_usd_per_run: float = 8.0
-    max_usd_per_day: float = 15.0
+    max_usd_per_run: float = 3.0
+    max_usd_per_day: float = 5.0
     parallel_calls: int = 4
-    parallel_questions: int = 2
+    # Uma pergunta por vez: o teto do dia mede o custo de cada uma.
+    parallel_questions: int = 1
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -157,7 +160,13 @@ class ClaudeForecastBot(ForecastBot):
             self._question_slots = asyncio.Semaphore(self.settings.parallel_questions)
         async with self._question_slots:
             self.claude.check_budget()
-            return await super()._run_individual_question(question)
+            spent_before = self.claude.spent_usd
+            try:
+                return await super()._run_individual_question(question)
+            finally:
+                # Com perguntas em paralelo a conta pega gasto das vizinhas e
+                # sai alta, o que só deixa o teto do dia mais cauteloso.
+                self.claude.note_question_cost(self.claude.spent_usd - spent_before)
 
     ##################################### PESQUISA #####################################
 

@@ -44,6 +44,8 @@ PRICES_PER_MTOK: dict[str, tuple[float, float, float]] = {
 }
 CACHE_WRITE_MULTIPLIER = 1.25
 USD_PER_WEB_SEARCH = 0.01  # US$ 10 por 1.000 buscas
+# Quanto reservar para uma pergunta enquanto o dia ainda não teve nenhuma.
+DEFAULT_QUESTION_USD = 1.0
 
 
 class ClaudeError(RuntimeError):
@@ -100,27 +102,47 @@ class Claude:
         # execução para a seguinte. O dia é o de início da execução, em UTC.
         self._day_ledger = day_ledger
         self._day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        self._spent_earlier_today = _read_day_ledger(day_ledger, self._day)
+        self._spent_earlier_today, self._largest_question_today = _read_day_ledger(
+            day_ledger, self._day
+        )
         self._write_day_ledger()
 
     @property
     def spent_today_usd(self) -> float:
         return self._spent_earlier_today + self.spent_usd
 
+    @property
+    def expected_question_usd(self) -> float:
+        """Quanto reservar para a próxima pergunta: a mais cara do dia até agora."""
+        return self._largest_question_today or DEFAULT_QUESTION_USD
+
+    def note_question_cost(self, cost: float) -> None:
+        if cost > self._largest_question_today:
+            self._largest_question_today = cost
+            self._write_day_ledger()
+
     def check_budget(self) -> None:
         """
-        Barra pergunta nova acima do teto. Quem já começou termina, então o
-        gasto pode passar do teto pelo custo das perguntas em andamento.
+        Barra pergunta nova que não cabe no teto.
+
+        No teto do dia a pergunta só começa se o gasto de hoje mais o custo
+        esperado dela couber, então o dia só passa do teto se uma pergunta
+        sair mais cara que todas as anteriores. O teto por execução é mais
+        simples: barra quando a execução já gastou o valor.
         """
         if self.spent_usd >= self.max_usd_per_run:
             raise BudgetExceeded(
                 f"Teto de US$ {self.max_usd_per_run:.2f} por execução atingido "
                 f"(gasto: US$ {self.spent_usd:.2f}). Pergunta fica para a próxima execução."
             )
-        if self.max_usd_per_day is not None and self.spent_today_usd >= self.max_usd_per_day:
+        if (
+            self.max_usd_per_day is not None
+            and self.spent_today_usd + self.expected_question_usd > self.max_usd_per_day
+        ):
             raise BudgetExceeded(
-                f"Teto de US$ {self.max_usd_per_day:.2f} por dia atingido "
-                f"(gasto hoje: US$ {self.spent_today_usd:.2f}). Pergunta fica para depois."
+                f"Teto de US$ {self.max_usd_per_day:.2f} por dia: gasto hoje "
+                f"US$ {self.spent_today_usd:.2f}, e a próxima pergunta "
+                f"(cerca de US$ {self.expected_question_usd:.2f}) não cabe. Fica para depois."
             )
 
     async def ask(
@@ -240,7 +262,13 @@ class Claude:
             self._day_ledger.parent.mkdir(parents=True, exist_ok=True)
             temp = self._day_ledger.with_suffix(".tmp")
             temp.write_text(
-                json.dumps({"dia": self._day, "usd": round(self.spent_today_usd, 4)})
+                json.dumps(
+                    {
+                        "dia": self._day,
+                        "usd": round(self.spent_today_usd, 4),
+                        "maior_pergunta": round(self._largest_question_today, 4),
+                    }
+                )
             )
             temp.replace(self._day_ledger)
         except OSError as error:
@@ -249,16 +277,21 @@ class Claude:
             )
 
 
-def _read_day_ledger(path: Path | None, day: str) -> float:
-    """Gasto já registrado no dia. Sem arquivo, ou com arquivo de outro dia, é zero."""
+def _read_day_ledger(path: Path | None, day: str) -> tuple[float, float]:
+    """
+    Gasto já registrado no dia e custo da pergunta mais cara do dia.
+    Sem arquivo, ou com arquivo de outro dia, os dois são zero.
+    """
     if path is None or not path.exists():
-        return 0.0
+        return 0.0, 0.0
     try:
         data = json.loads(path.read_text())
-        return float(data["usd"]) if data.get("dia") == day else 0.0
+        if data.get("dia") != day:
+            return 0.0, 0.0
+        return float(data["usd"]), float(data.get("maior_pergunta", 0.0))
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         logger.warning("Gasto do dia ilegível em %s (%s); contando do zero", path, error)
-        return 0.0
+        return 0.0, 0.0
 
 
 def _final_text(content: list[Any]) -> str:

@@ -16,7 +16,7 @@ O código fica em <https://github.com/matheusdmlopes/metaculus-bot>, aberto, e o
 
 ## Dinheiro
 
-Toda execução de verdade gasta crédito da API (pesquisa com busca na web + cinco previsões por pergunta). Avisar antes de rodar e dizer o custo no fim; o resumo da execução mostra o total. `uv run pytest` é offline e não gasta nada. Os tetos (US$ 8 por execução, US$ 15 por dia) ficam no `Settings` do `main.py`; não subir sem o Matheus pedir.
+Toda execução de verdade gasta crédito da API (pesquisa com busca na web + cinco previsões por pergunta). Avisar antes de rodar e dizer o custo no fim; o resumo da execução mostra o total. `uv run pytest` é offline e não gasta nada. Os tetos (US$ 3 por execução, US$ 5 por dia) ficam no `Settings` do `main.py`. O Matheus fixou o máximo de US$ 5 por dia em 17/11/2026: o crédito é dividido com outros projetos dele. Não subir teto nem trocar para modelo mais caro sem ele pedir.
 
 ## Código
 
@@ -24,3 +24,4 @@ Toda execução de verdade gasta crédito da API (pesquisa com busca na web + ci
 - Saída estruturada (`schema`) e busca na web (`tools`) não vão na mesma chamada.
 - O CI do bot roda em Python 3.12, a mesma versão do ambiente local.
 - Depois de mexer: `uv run pytest`.
+- `configurar.sh`: chave colada aparece na tela e é conferida (tamanho, formato). Nada de entrada invisível (`read -s`).

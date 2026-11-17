@@ -66,16 +66,16 @@ O fim de cada execução mostra chamadas, buscas, dólares gastos e o total do d
 
 | Variável | Padrão | Para quê |
 |---|---|---|
-| `BOT_RESEARCH_MODEL` | `claude-opus-5-5` | Modelo da pesquisa |
-| `BOT_FORECAST_MODEL` | `claude-opus-5-5` | Modelo das previsões |
+| `BOT_RESEARCH_MODEL` | `claude-sonnet-5-5` | Modelo da pesquisa (`claude-opus-5-5` é melhor e custa o dobro) |
+| `BOT_FORECAST_MODEL` | `claude-sonnet-5-5` | Modelo das previsões |
 | `BOT_RESEARCH_EFFORT`, `BOT_FORECAST_EFFORT` | `high` | Esforço de raciocínio |
-| `BOT_MAX_SEARCHES`, `BOT_MAX_FETCHES` | `8`, `5` | Buscas e páginas lidas por pergunta |
+| `BOT_MAX_SEARCHES`, `BOT_MAX_FETCHES` | `6`, `3` | Buscas e páginas lidas por pergunta |
 | `BOT_FORECASTS_PER_QUESTION` | `5` | Previsões por pergunta |
-| `BOT_MAX_USD_PER_RUN` | `8` | Teto por execução; passou, as perguntas restantes ficam para a próxima |
-| `BOT_MAX_USD_PER_DAY` | `15` | Teto por dia (UTC), somando todas as execuções; cabe nos US$ 500 de crédito mensal |
-| `BOT_PARALLEL_CALLS`, `BOT_PARALLEL_QUESTIONS` | `4`, `2` | Chamadas e perguntas em paralelo |
+| `BOT_MAX_USD_PER_RUN` | `3` | Teto por execução; passou, as perguntas restantes ficam para a próxima |
+| `BOT_MAX_USD_PER_DAY` | `5` | Teto por dia (UTC), somando todas as execuções; uns US$ 150 por mês no máximo |
+| `BOT_PARALLEL_CALLS`, `BOT_PARALLEL_QUESTIONS` | `4`, `1` | Chamadas e perguntas em paralelo |
 
-Os tetos barram pergunta nova; a que já começou termina, então o gasto pode passar do teto pelo custo de uma ou duas perguntas. O gasto do dia fica em `.gasto/gasto-do-dia.json`: no Actions ele passa de uma execução para a outra pelo cache do workflow, e na sua máquina é um arquivo à parte. O workflow `Test Bot` não entra na conta do dia. A trava que não depende do bot é o limite mensal do workspace no Console da Anthropic.
+No teto do dia, pergunta nova só começa se couber: conta o gasto de hoje mais o custo da pergunta mais cara do dia (US$ 1 enquanto não houve nenhuma). O dia só passa do teto se uma pergunta sair mais cara que todas as anteriores. O gasto do dia fica em `.gasto/gasto-do-dia.json`: no Actions ele passa de uma execução para a outra pelo cache do workflow, e na sua máquina é um arquivo à parte. O workflow `Test Bot` não entra na conta do dia. A trava que não depende do bot é o limite mensal do workspace no Console da Anthropic.
 
 ## No GitHub Actions
 
