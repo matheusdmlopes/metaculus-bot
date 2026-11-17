@@ -16,7 +16,7 @@ O código fica em <https://github.com/matheusdmlopes/metaculus-bot>, aberto, e o
 
 ## Dinheiro
 
-Toda execução de verdade gasta crédito da API (pesquisa com busca na web + cinco previsões por pergunta). Avisar antes de rodar e dizer o custo no fim; o resumo da execução mostra o total. `uv run pytest` é offline e não gasta nada.
+Toda execução de verdade gasta crédito da API (pesquisa com busca na web + cinco previsões por pergunta). Avisar antes de rodar e dizer o custo no fim; o resumo da execução mostra o total. `uv run pytest` é offline e não gasta nada. Os tetos (US$ 8 por execução, US$ 15 por dia) ficam no `Settings` do `main.py`; não subir sem o Matheus pedir.
 
 ## Código
 

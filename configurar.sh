@@ -262,7 +262,7 @@ stage "GitHub: ligar o bot no torneio"
 say "Falta mandar as duas chaves para o repositório no GitHub (como segredo, ninguém vê)"
 say "e ligar o agendamento. Daí em diante o bot roda sozinho a cada 20 minutos, prevê as"
 say "perguntas abertas do torneio e do MiniBench e gasta crédito de verdade."
-note "Teto do bot: US\$ 25 por execução. A trava de verdade é o limite mensal do workspace no Console."
+note "Tetos do bot: US\$ 8 por execução e US\$ 15 por dia. Além deles, ponha o limite mensal no workspace no Console."
 note "Depois de ligado, não ajuste o bot olhando resposta de pergunta ainda aberta do torneio."
 if confirm "Mandar as chaves e ligar agora?"; then
   set_secret METACULUS_TOKEN "$METACULUS_TOKEN"

@@ -31,6 +31,23 @@ jobs:
           version: "0.13.1"
       - name: Install dependencies
         run: uv sync --locked
+      # Teto por dia: o arquivo com o gasto de hoje passa de uma execução para a
+      # seguinte pelo cache. A chave nova a cada execução existe porque cache não
+      # se sobrescreve; a restauração pega a mais recente do dia.
+      - name: Day of this run (UTC)
+        id: day
+        run: |
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          mkdir -p .gasto
+      - name: Restore today's spend
+        uses: actions/cache/restore@v4
+        with:
+          path: .gasto
+          key: gasto-${{ steps.day.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gasto-${{ steps.day.outputs.day }}-
+      - name: Start the count if today has none
+        run: test -f .gasto/gasto-do-dia.json || echo '{}' > .gasto/gasto-do-dia.json
       - name: Run bot
         run: uv run python main.py
         # Segredos em Settings -> Secrets and variables -> Actions.
@@ -41,6 +58,13 @@ jobs:
           BOT_RESEARCH_MODEL: ${{ vars.BOT_RESEARCH_MODEL }}
           BOT_FORECAST_MODEL: ${{ vars.BOT_FORECAST_MODEL }}
           BOT_MAX_USD_PER_RUN: ${{ vars.BOT_MAX_USD_PER_RUN }}
+          BOT_MAX_USD_PER_DAY: ${{ vars.BOT_MAX_USD_PER_DAY }}
+      - name: Save today's spend
+        if: always() && steps.day.outputs.day != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .gasto
+          key: gasto-${{ steps.day.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Keep the schedule alive
         # Em repositório público o GitHub desliga o agendamento depois de 60 dias
         # sem atividade no repositório. Religar pela API zera essa contagem.

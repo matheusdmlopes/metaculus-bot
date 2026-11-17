@@ -177,3 +177,6 @@ temp/
 
 # Relatórios das execuções locais
 relatorios/
+
+# Gasto do dia (teto diário do bot)
+.gasto/

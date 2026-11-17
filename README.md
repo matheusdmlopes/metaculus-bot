@@ -62,7 +62,7 @@ Ajuste de prompt se faz com a área de teste, com perguntas de fora do torneio o
 
 ## Custo e ajustes
 
-O fim de cada execução mostra chamadas, buscas e dólares gastos. O custo por pergunta também sai no comentário publicado. Variáveis opcionais (no `.env` ou em Settings → Variables do repositório):
+O fim de cada execução mostra chamadas, buscas, dólares gastos e o total do dia. O custo por pergunta também sai no comentário publicado. Variáveis opcionais (no `.env` ou em Settings → Variables do repositório):
 
 | Variável | Padrão | Para quê |
 |---|---|---|
@@ -71,8 +71,11 @@ O fim de cada execução mostra chamadas, buscas e dólares gastos. O custo por 
 | `BOT_RESEARCH_EFFORT`, `BOT_FORECAST_EFFORT` | `high` | Esforço de raciocínio |
 | `BOT_MAX_SEARCHES`, `BOT_MAX_FETCHES` | `8`, `5` | Buscas e páginas lidas por pergunta |
 | `BOT_FORECASTS_PER_QUESTION` | `5` | Previsões por pergunta |
-| `BOT_MAX_USD_PER_RUN` | `25` | Teto por execução; passou, as perguntas restantes ficam para a próxima |
+| `BOT_MAX_USD_PER_RUN` | `8` | Teto por execução; passou, as perguntas restantes ficam para a próxima |
+| `BOT_MAX_USD_PER_DAY` | `15` | Teto por dia (UTC), somando todas as execuções; cabe nos US$ 500 de crédito mensal |
 | `BOT_PARALLEL_CALLS`, `BOT_PARALLEL_QUESTIONS` | `4`, `2` | Chamadas e perguntas em paralelo |
+
+Os tetos barram pergunta nova; a que já começou termina, então o gasto pode passar do teto pelo custo de uma ou duas perguntas. O gasto do dia fica em `.gasto/gasto-do-dia.json`: no Actions ele passa de uma execução para a outra pelo cache do workflow, e na sua máquina é um arquivo à parte. O workflow `Test Bot` não entra na conta do dia. A trava que não depende do bot é o limite mensal do workspace no Console da Anthropic.
 
 ## No GitHub Actions
 

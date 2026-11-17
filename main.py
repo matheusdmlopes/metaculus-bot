@@ -68,6 +68,9 @@ logger = logging.getLogger(__name__)
 
 TEST_TOURNAMENT = "bot-testing-area"
 REPORTS_FOLDER = Path(__file__).parent / "relatorios"
+# Gasto do dia, lido e gravado a cada execução. No GitHub Actions a pasta vai
+# e volta pelo cache do workflow; sem isso o teto do dia não soma nada.
+SPEND_FILE = Path(__file__).parent / ".gasto" / "gasto-do-dia.json"
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,8 @@ class Settings:
     max_searches: int = 8
     max_fetches: int = 5
     forecasts_per_question: int = 5
-    max_usd_per_run: float = 25.0
+    max_usd_per_run: float = 8.0
+    max_usd_per_day: float = 15.0
     parallel_calls: int = 4
     parallel_questions: int = 2
 
@@ -670,13 +674,18 @@ def print_summary(
         message = str(failure)
         print(f"FALHOU {type(failure).__name__}: {message[:300]}")
     if postponed:
-        print(f"{len(postponed)} pergunta(s) adiada(s): teto de gasto da execução atingido.")
+        print(f"{len(postponed)} pergunta(s) adiada(s): teto de gasto atingido (execução ou dia).")
 
     print(
         f"\nTotal: {len(reports)} prevista(s), {len(failures)} com falha | "
         f"{claude.calls} chamada(s) ao Claude, {claude.web_searches} busca(s), "
         f"US$ {claude.spent_usd:.2f}"
     )
+    if claude.max_usd_per_day is not None:
+        print(
+            f"Gasto hoje (UTC): US$ {claude.spent_today_usd:.2f} "
+            f"de US$ {claude.max_usd_per_day:.2f}"
+        )
     print("=" * 80)
     return 1 if failures else 0
 
@@ -684,7 +693,10 @@ def print_summary(
 async def run(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     claude = Claude(
-        max_usd_per_run=settings.max_usd_per_run, parallel_calls=settings.parallel_calls
+        max_usd_per_run=settings.max_usd_per_run,
+        parallel_calls=settings.parallel_calls,
+        max_usd_per_day=settings.max_usd_per_day,
+        day_ledger=SPEND_FILE,
     )
     if args.checar:
         return await check_keys(settings, claude)
@@ -713,7 +725,10 @@ async def run(args: argparse.Namespace) -> int:
         f"Modo: {'pergunta avulsa' if local_only else args.mode} | "
         f"publica: {'sim' if publish else 'não'} | "
         f"pesquisa: {settings.research_model} | previsão: {settings.forecast_model} x"
-        f"{settings.forecasts_per_question} | teto: US$ {settings.max_usd_per_run:.2f}\n"
+        f"{settings.forecasts_per_question}\n"
+        f"Teto: US$ {settings.max_usd_per_run:.2f} por execução, "
+        f"US$ {settings.max_usd_per_day:.2f} por dia "
+        f"(já gasto hoje: US$ {claude.spent_today_usd:.2f})\n"
     )
 
     results: list[ForecastReport | BaseException]

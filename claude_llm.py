@@ -11,7 +11,8 @@ streaming, e cuida de quatro coisas que o resto do bot não precisa saber:
 - custo: cada resposta é convertida em dólar pelo `usage` e somada no total da
   execução e no gerenciador de custo do forecasting-tools (é o número que
   aparece no comentário publicado);
-- teto: `check_budget()` barra pergunta nova quando a execução passou do limite.
+- teto: `check_budget()` barra pergunta nova quando a execução ou o dia passou
+  do limite. O gasto do dia fica num arquivo, para valer entre execuções.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -56,7 +59,7 @@ class ClaudeTruncated(ClaudeError):
 
 
 class BudgetExceeded(ClaudeError):
-    """A execução passou do teto de gasto; perguntas novas ficam para a próxima."""
+    """A execução ou o dia passou do teto de gasto; perguntas novas ficam para depois."""
 
 
 @dataclass
@@ -76,8 +79,16 @@ class Reply:
 
 
 class Claude:
-    def __init__(self, *, max_usd_per_run: float, parallel_calls: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_usd_per_run: float,
+        parallel_calls: int,
+        max_usd_per_day: float | None = None,
+        day_ledger: Path | None = None,
+    ) -> None:
         self.max_usd_per_run = max_usd_per_run
+        self.max_usd_per_day = max_usd_per_day
         self.spent_usd = 0.0
         self.calls = 0
         self.web_searches = 0
@@ -85,12 +96,31 @@ class Claude:
         # Cliente e semáforo nascem dentro do event loop, na primeira chamada.
         self._client: anthropic.AsyncAnthropic | None = None
         self._slots: asyncio.Semaphore | None = None
+        # O teto do dia depende do arquivo: é ele que leva o gasto de uma
+        # execução para a seguinte. O dia é o de início da execução, em UTC.
+        self._day_ledger = day_ledger
+        self._day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._spent_earlier_today = _read_day_ledger(day_ledger, self._day)
+        self._write_day_ledger()
+
+    @property
+    def spent_today_usd(self) -> float:
+        return self._spent_earlier_today + self.spent_usd
 
     def check_budget(self) -> None:
+        """
+        Barra pergunta nova acima do teto. Quem já começou termina, então o
+        gasto pode passar do teto pelo custo das perguntas em andamento.
+        """
         if self.spent_usd >= self.max_usd_per_run:
             raise BudgetExceeded(
                 f"Teto de US$ {self.max_usd_per_run:.2f} por execução atingido "
                 f"(gasto: US$ {self.spent_usd:.2f}). Pergunta fica para a próxima execução."
+            )
+        if self.max_usd_per_day is not None and self.spent_today_usd >= self.max_usd_per_day:
+            raise BudgetExceeded(
+                f"Teto de US$ {self.max_usd_per_day:.2f} por dia atingido "
+                f"(gasto hoje: US$ {self.spent_today_usd:.2f}). Pergunta fica para depois."
             )
 
     async def ask(
@@ -200,6 +230,35 @@ class Claude:
         self.spent_usd += cost
         self.web_searches += searches
         MonetaryCostManager.increase_current_usage_in_parent_managers(cost)
+        # A cada chamada, para o número estar certo mesmo se a execução for morta.
+        self._write_day_ledger()
+
+    def _write_day_ledger(self) -> None:
+        if self._day_ledger is None:
+            return
+        try:
+            self._day_ledger.parent.mkdir(parents=True, exist_ok=True)
+            temp = self._day_ledger.with_suffix(".tmp")
+            temp.write_text(
+                json.dumps({"dia": self._day, "usd": round(self.spent_today_usd, 4)})
+            )
+            temp.replace(self._day_ledger)
+        except OSError as error:
+            logger.warning(
+                "Não consegui gravar o gasto do dia em %s: %s", self._day_ledger, error
+            )
+
+
+def _read_day_ledger(path: Path | None, day: str) -> float:
+    """Gasto já registrado no dia. Sem arquivo, ou com arquivo de outro dia, é zero."""
+    if path is None or not path.exists():
+        return 0.0
+    try:
+        data = json.loads(path.read_text())
+        return float(data["usd"]) if data.get("dia") == day else 0.0
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        logger.warning("Gasto do dia ilegível em %s (%s); contando do zero", path, error)
+        return 0.0
 
 
 def _final_text(content: list[Any]) -> str:
