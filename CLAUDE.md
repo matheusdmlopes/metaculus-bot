@@ -10,6 +10,10 @@ O regulamento proíbe rodar o bot em pergunta aberta (ou que vai abrir) do torne
 - Não ler previsão ou raciocínio de pergunta ainda aberta do torneio para decidir mudança de prompt.
 - Para ajustar o bot: área de teste (`--mode test_questions`), `--texto`, `--pergunta` com pergunta de fora do torneio, ou revisão de perguntas já resolvidas (skill `review-bot`, só leitura).
 
+## Repositório público
+
+O código fica em <https://github.com/matheusdmlopes/metaculus-bot>, aberto, e os logs do Actions também. Nada de chave, `.env`, conteúdo de `relatorios/` ou previsão de pergunta ainda aberta em commit, log ou mensagem de commit. As chaves vivem só no `.env` local e nos segredos do repositório.
+
 ## Dinheiro
 
 Toda execução de verdade gasta crédito da API (pesquisa com busca na web + cinco previsões por pergunta). Avisar antes de rodar e dizer o custo no fim; o resumo da execução mostra o total. `uv run pytest` é offline e não gasta nada.
